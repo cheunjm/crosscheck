@@ -1,0 +1,70 @@
+name: Dispatch Decision Log
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  dispatch:
+    if: >
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'decision-log')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.OPENCLAW_BOT_APP_ID }}
+          private-key: ${{ secrets.OPENCLAW_BOT_PRIVATE_KEY }}
+          repositories: engineering-log
+
+      - name: Calculate time to merge
+        id: meta
+        run: |
+          CREATED="${{ github.event.pull_request.created_at }}"
+          MERGED="${{ github.event.pull_request.merged_at }}"
+          HOURS=$(python3 -c "
+          from datetime import datetime
+          c = datetime.fromisoformat('$CREATED'.replace('Z','+00:00'))
+          m = datetime.fromisoformat('$MERGED'.replace('Z','+00:00'))
+          print(f'{(m-c).total_seconds()/3600:.1f}')
+          ")
+          echo "hours=$HOURS" >> $GITHUB_OUTPUT
+
+      - name: Extract Linear issue ID
+        id: linear
+        run: |
+          ID=$(echo "${{ github.event.pull_request.title }}" | grep -oP '^\[([A-Z]+-\d+)\]' | tr -d '[]' || echo "")
+          echo "issue_id=$ID" >> $GITHUB_OUTPUT
+
+      - name: Dispatch to engineering-log
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "https://api.github.com/repos/cheunjm/engineering-log/dispatches" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d @- <<'PAYLOAD'
+          {
+            "event_type": "new-decision",
+            "client_payload": {
+              "source_repo": "${{ github.repository }}",
+              "pr_number": ${{ github.event.pull_request.number }},
+              "pr_title": ${{ toJSON(github.event.pull_request.title) }},
+              "pr_body": ${{ toJSON(github.event.pull_request.body) }},
+              "pr_url": "${{ github.event.pull_request.html_url }}",
+              "branch": "${{ github.event.pull_request.head.ref }}",
+              "merged_by": "${{ github.event.pull_request.merged_by.login }}",
+              "linear_issue": "${{ steps.linear.outputs.issue_id }}",
+              "files_changed": ${{ github.event.pull_request.changed_files }},
+              "lines": "+${{ github.event.pull_request.additions }} -${{ github.event.pull_request.deletions }} ttm=${{ steps.meta.outputs.hours }}h"
+            }
+          }
+          PAYLOAD
+          )
+          if [ "$RESPONSE" != "204" ]; then
+            echo "::error::repository_dispatch failed with HTTP $RESPONSE"
+            exit 1
+          fi
+          echo "Dispatched successfully"

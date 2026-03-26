@@ -1,0 +1,49 @@
+name: Claude PR Description
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  auto-label-decision-log:
+    runs-on: ubuntu-latest
+    if: >
+      startsWith(github.event.pull_request.head.ref, 'feat/') ||
+      startsWith(github.event.pull_request.head.ref, 'fix/')
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Add decision-log label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --add-label "decision-log"
+
+  generate-description:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: --allowedTools mcp__github,Bash
+          prompt: |
+            A new PR was just opened. Generate a comprehensive PR description including:
+            1. Summary of changes (2-3 sentences)
+            2. Type of change: feature / fix / refactor / chore / docs
+            3. Key changes (bullet list)
+            4. Testing done
+            5. Breaking changes (if any, otherwise omit)
+
+            After generating the description, use `gh pr edit ${{ github.event.pull_request.number }} --body "<generated description>"` to update the PR description.
+            Be concise and clear.
