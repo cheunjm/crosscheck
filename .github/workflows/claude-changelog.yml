@@ -1,0 +1,40 @@
+name: Claude CHANGELOG Update
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  update-changelog:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: --allowedTools mcp__github,Bash
+          prompt: |
+            A PR was just merged. Update CHANGELOG.md (create it if it doesnt exist).
+
+            PR info:
+            - Title: ${{ github.event.pull_request.title }}
+            - Number: #${{ github.event.pull_request.number }}
+            - Author: ${{ github.event.pull_request.user.login }}
+
+            If CHANGELOG.md doesnt exist, create it with standard format.
+            Add an entry under "## [Unreleased]" section (or todays date).
+
+            Entry format:
+            - [type] Brief description (#PR-number) — @author
+
+            Where type is one of: Added / Changed / Fixed / Removed / Security
+
+            Commit the updated CHANGELOG.md to the default branch.
