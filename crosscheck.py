@@ -4,9 +4,14 @@
 A Claude Code PreToolUse hook that sends diffs to a second model for
 independent review before edits are applied.
 
-Usage:
+Usage as hook:
     Register as a PreToolUse hook in ~/.claude/settings.json for
     Edit, Write, and NotebookEdit tool calls.
+
+CLI modes:
+    python3 crosscheck.py --test          Verify model connectivity
+    python3 crosscheck.py --dry-run       Show what would be reviewed (pipe hook input via stdin)
+    python3 crosscheck.py --version       Show version
 
 Configuration:
     Config file: ~/.claude/crosscheck.json
@@ -15,52 +20,70 @@ Configuration:
 
 from __future__ import annotations
 
+import argparse
 import fnmatch
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
+__version__ = "0.1.0"
+
 # --- Constants ---
 
-TOOL_NAMES = {"Edit", "Write", "NotebookEdit"}
+TOOL_NAMES: set[str] = {"Edit", "Write", "NotebookEdit"}
 
-SEVERITY_LEVELS = {"low": 0, "medium": 1, "high": 2}
+SEVERITY_LEVELS: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "qwen2.5:14b",
     "endpoint": "http://localhost:11434/v1/chat/completions",
     "threshold": "medium",
-    "include": ["*.py", "*.ts", "*.js", "*.tsx", "*.jsx"],
-    "exclude": ["*.test.*", "*.spec.*", "node_modules/**"],
+    "include": ["*.py", "*.ts", "*.js", "*.tsx", "*.jsx", "*.go", "*.rs", "*.java"],
+    "exclude": ["*.test.*", "*.spec.*", "*.min.*", "node_modules/**", "dist/**", "build/**"],
     "max_diff_lines": 200,
+    "timeout": 30,
 }
 
 REVIEW_SYSTEM_PROMPT = """\
-You are an adversarial code reviewer. Your job is to find bugs, security issues, \
-logic errors, and bad practices in code diffs. Be concise and direct.
+You are an adversarial code reviewer. Your job is to find real bugs, security \
+vulnerabilities, and logic errors that the AI code generator likely missed.
 
-For each issue found, respond with a JSON array of objects:
-[
-  {
-    "severity": "low" | "medium" | "high",
-    "line": <line number or null>,
-    "message": "<concise description of the issue>"
-  }
-]
+Respond with ONLY a JSON array of issues found. No other text.
 
-If the code looks fine, respond with an empty array: []
+Format:
+[{"severity": "low|medium|high", "line": <number or null>, "message": "<issue>"}]
 
-Rules:
-- Focus on real bugs, security issues, and logic errors
-- Do NOT flag style preferences or minor formatting
-- Do NOT flag issues that are clearly intentional
-- Be specific about what's wrong and why
-- Keep messages under 100 characters each
+If the code is fine, respond with: []
+
+Focus on these categories:
+- SECURITY: injection, XSS, path traversal, hardcoded secrets, unsafe deserialization
+- BUGS: off-by-one, null/undefined access, race conditions, resource leaks
+- LOGIC: wrong comparisons, inverted conditions, missing edge cases, infinite loops
+- AI-SPECIFIC: hallucinated imports/APIs, wrong function signatures, deprecated methods, \
+non-existent modules, incorrect async/await patterns
+
+Do NOT flag:
+- Style preferences or formatting
+- Missing comments or documentation
+- Naming conventions
+- Type annotation completeness
+- Things that are clearly intentional from context
+
+Keep each message under 120 characters. Be specific.\
 """
+
+
+# --- Logging ---
+
+
+def log(msg: str) -> None:
+    """Log to stderr so it doesn't interfere with hook JSON output."""
+    print(f"[crosscheck] {msg}", file=sys.stderr)
 
 
 # --- Config ---
@@ -70,7 +93,6 @@ def load_config() -> dict[str, Any]:
     """Load configuration from file and environment variables."""
     config = dict(DEFAULT_CONFIG)
 
-    # Load from config file
     config_path = Path.home() / ".claude" / "crosscheck.json"
     if config_path.exists():
         try:
@@ -78,25 +100,24 @@ def load_config() -> dict[str, Any]:
                 file_config = json.load(f)
             config.update(file_config)
         except (json.JSONDecodeError, OSError):
-            pass  # Fall back to defaults
+            pass
 
-    # Environment variable overrides
     env_map: dict[str, str] = {
         "CROSSCHECK_MODEL": "model",
         "CROSSCHECK_ENDPOINT": "endpoint",
         "CROSSCHECK_THRESHOLD": "threshold",
         "CROSSCHECK_MAX_DIFF_LINES": "max_diff_lines",
+        "CROSSCHECK_TIMEOUT": "timeout",
     }
 
     for env_key, config_key in env_map.items():
         val = os.environ.get(env_key)
         if val is not None:
-            if config_key == "max_diff_lines":
+            if config_key in ("max_diff_lines", "timeout"):
                 config[config_key] = int(val)
             else:
                 config[config_key] = val
 
-    # List overrides (comma-separated)
     include_env = os.environ.get("CROSSCHECK_INCLUDE")
     if include_env:
         config["include"] = [p.strip() for p in include_env.split(",")]
@@ -122,34 +143,59 @@ def matches_patterns(file_path: str, patterns: list[str]) -> bool:
 
 def should_review(file_path: str, config: dict[str, Any]) -> bool:
     """Determine if a file should be reviewed based on include/exclude patterns."""
-    include = config.get("include", DEFAULT_CONFIG["include"])
-    exclude = config.get("exclude", DEFAULT_CONFIG["exclude"])
+    include: list[str] = config.get("include", DEFAULT_CONFIG["include"])
+    exclude: list[str] = config.get("exclude", DEFAULT_CONFIG["exclude"])
 
     if not matches_patterns(file_path, include):
         return False
+    return not matches_patterns(file_path, exclude)
 
-    if matches_patterns(file_path, exclude):
-        return False
 
-    return True
+# --- Diff context ---
+
+
+def build_review_prompt(
+    tool_name: str,
+    file_path: str,
+    content: str,
+    old_content: str | None = None,
+) -> str:
+    """Build the review prompt with full diff context."""
+    parts: list[str] = []
+
+    if tool_name == "Edit" and old_content:
+        parts.append(f"Review this edit to `{file_path}`:")
+        parts.append("")
+        parts.append("BEFORE:")
+        parts.append(f"```\n{old_content}\n```")
+        parts.append("")
+        parts.append("AFTER:")
+        parts.append(f"```\n{content}\n```")
+    elif tool_name == "Write":
+        parts.append(f"Review this new file being written to `{file_path}`:")
+        parts.append(f"```\n{content}\n```")
+    else:
+        parts.append(f"Review this code change in `{file_path}`:")
+        parts.append(f"```\n{content}\n```")
+
+    return "\n".join(parts)
 
 
 # --- Model interaction ---
 
 
-def build_review_prompt(file_path: str, content: str) -> str:
-    """Build the user prompt for the review model."""
-    return f"Review this code being written to `{file_path}`:\n\n```\n{content}\n```"
-
-
 def call_review_model(
     prompt: str, config: dict[str, Any]
-) -> list[dict[str, Any]]:
-    """Send the diff to the review model and parse the response."""
+) -> tuple[list[dict[str, Any]], float, bool]:
+    """Send the diff to the review model and parse the response.
+
+    Returns (issues, elapsed_seconds, success).
+    """
     endpoint: str = config["endpoint"]
     model: str = config["model"]
+    timeout: int = config.get("timeout", 30)
 
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
@@ -159,11 +205,10 @@ def call_review_model(
         "max_tokens": 1024,
     }
 
-    headers = {
+    headers: dict[str, str] = {
         "Content-Type": "application/json",
     }
 
-    # Support API keys via environment
     api_key = os.environ.get("CROSSCHECK_API_KEY") or os.environ.get(
         "OPENROUTER_API_KEY"
     )
@@ -173,28 +218,45 @@ def call_review_model(
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
 
+    start = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, OSError):
-        # Model unavailable — fail open (don't block edits)
-        return []
+    except urllib.error.HTTPError as e:
+        elapsed = time.monotonic() - start
+        log(f"HTTP {e.code} from {endpoint} ({elapsed:.1f}s)")
+        return [], elapsed, False
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        elapsed = time.monotonic() - start
+        log(f"Connection failed: {e} ({elapsed:.1f}s)")
+        return [], elapsed, False
     except json.JSONDecodeError:
-        return []
+        elapsed = time.monotonic() - start
+        log(f"Invalid JSON response ({elapsed:.1f}s)")
+        return [], elapsed, False
 
-    # Extract the response content
+    elapsed = time.monotonic() - start
+
+    # Extract the response content — handle thinking models
     try:
-        response_text = result["choices"][0]["message"]["content"]
-    except (KeyError, IndexError):
-        return []
+        choice = result["choices"][0]["message"]
+        response_text: str = choice.get("content") or ""
 
-    return parse_review_response(response_text)
+        # Some models (e.g. qwen3, deepseek-r1) put reasoning in a separate field
+        if not response_text and "thinking" in choice:
+            response_text = ""
+    except (KeyError, IndexError):
+        return [], elapsed, False
+
+    issues = parse_review_response(response_text)
+    return issues, elapsed, True
 
 
 def parse_review_response(response_text: str) -> list[dict[str, Any]]:
     """Parse the model's review response into structured issues."""
-    # Try to extract JSON from the response
     text = response_text.strip()
+    if not text:
+        return []
 
     # Handle markdown code blocks
     if "```" in text:
@@ -207,25 +269,45 @@ def parse_review_response(response_text: str) -> list[dict[str, Any]]:
                 text = cleaned
                 break
 
+    # Try direct parse
     try:
         issues = json.loads(text)
         if isinstance(issues, list):
-            return issues
+            return _validate_issues(issues)
     except json.JSONDecodeError:
         pass
 
-    # If we can't parse JSON, try to find a JSON array in the text
+    # Try to extract JSON array from surrounding text
     start = text.find("[")
     end = text.rfind("]")
     if start != -1 and end != -1 and end > start:
         try:
             issues = json.loads(text[start : end + 1])
             if isinstance(issues, list):
-                return issues
+                return _validate_issues(issues)
         except json.JSONDecodeError:
             pass
 
     return []
+
+
+def _validate_issues(issues: list[Any]) -> list[dict[str, Any]]:
+    """Validate and normalize issue objects."""
+    validated: list[dict[str, Any]] = []
+    for item in issues:
+        if not isinstance(item, dict):
+            continue
+        if "message" not in item:
+            continue
+        severity = str(item.get("severity", "medium")).lower()
+        if severity not in SEVERITY_LEVELS:
+            severity = "medium"
+        validated.append({
+            "severity": severity,
+            "line": item.get("line"),
+            "message": str(item["message"])[:200],
+        })
+    return validated
 
 
 def filter_by_threshold(
@@ -243,28 +325,43 @@ def filter_by_threshold(
 # --- Hook interface ---
 
 
-def extract_tool_input(hook_input: dict[str, Any]) -> tuple[str | None, str | None]:
-    """Extract file path and content from the tool input."""
-    tool_name = hook_input.get("tool_name", "")
-    tool_input = hook_input.get("tool_input", {})
+def extract_tool_input(
+    hook_input: dict[str, Any],
+) -> tuple[str, str | None, str | None, str | None]:
+    """Extract tool name, file path, new content, and old content from hook input."""
+    tool_name: str = hook_input.get("tool_name", "")
+    tool_input: dict[str, Any] = hook_input.get("tool_input", {})
 
     if tool_name == "Write":
-        return tool_input.get("file_path"), tool_input.get("content")
+        return tool_name, tool_input.get("file_path"), tool_input.get("content"), None
     elif tool_name == "Edit":
-        return tool_input.get("file_path"), tool_input.get("new_string")
+        return (
+            tool_name,
+            tool_input.get("file_path"),
+            tool_input.get("new_string"),
+            tool_input.get("old_string"),
+        )
     elif tool_name == "NotebookEdit":
-        return tool_input.get("file_path"), tool_input.get("new_source")
+        return (
+            tool_name,
+            tool_input.get("file_path"),
+            tool_input.get("new_source"),
+            tool_input.get("old_source"),
+        )
 
-    return None, None
+    return tool_name, None, None, None
 
 
-def format_hook_response(issues: list[dict[str, Any]], file_path: str) -> dict[str, Any]:
+def format_hook_response(
+    issues: list[dict[str, Any]], file_path: str, elapsed: float
+) -> dict[str, Any]:
     """Format issues as a Claude Code hook response."""
     if not issues:
         return {"decision": "approve"}
 
-    # Build warning message
-    lines = [f"crosscheck found {len(issues)} issue(s) in {os.path.basename(file_path)}:"]
+    lines: list[str] = [
+        f"crosscheck found {len(issues)} issue(s) in {os.path.basename(file_path)} ({elapsed:.1f}s):"
+    ]
     for issue in issues:
         severity = issue.get("severity", "medium").upper()
         line_num = issue.get("line")
@@ -280,52 +377,157 @@ def format_hook_response(issues: list[dict[str, Any]], file_path: str) -> dict[s
     }
 
 
-def main() -> None:
-    """Main hook entry point. Reads hook input from stdin."""
+def approve() -> None:
+    """Output an approve decision and exit."""
+    print(json.dumps({"decision": "approve"}))
+
+
+# --- CLI modes ---
+
+
+def cmd_test(config: dict[str, Any]) -> None:
+    """Test connectivity to the review model."""
+    endpoint = config["endpoint"]
+    model = config["model"]
+
+    print(f"crosscheck v{__version__}")
+    print(f"  Model:    {model}")
+    print(f"  Endpoint: {endpoint}")
+    print(f"  Timeout:  {config.get('timeout', 30)}s")
+    print()
+
+    test_prompt = 'Review this code:\n\n```python\npassword = "admin123"\n```'
+    print(f"Sending test review to {model}...")
+
+    issues, elapsed, success = call_review_model(test_prompt, config)
+
+    if not success:
+        print(f"\n  FAIL: Could not get a valid response from {endpoint}")
+        print(f"  Ensure the endpoint is reachable and the model '{model}' is loaded.")
+        print(f"  Elapsed: {elapsed:.1f}s")
+        sys.exit(1)
+
+    print(f"  Response in {elapsed:.1f}s")
+
+    if issues:
+        print(f"  Found {len(issues)} issue(s) — model is working correctly:")
+        for issue in issues:
+            sev = issue.get("severity", "?").upper()
+            msg = issue.get("message", "")
+            print(f"    [{sev}] {msg}")
+    else:
+        print("  No issues found (model may not have flagged the test case, but connectivity works)")
+
+    print()
+    print("OK — crosscheck is ready.")
+
+
+def cmd_dry_run(config: dict[str, Any]) -> None:
+    """Show what would be reviewed without calling the model."""
     try:
-        raw_input = sys.stdin.read()
-        hook_input = json.loads(raw_input)
+        raw = sys.stdin.read()
+        hook_input = json.loads(raw)
     except (json.JSONDecodeError, OSError):
-        # Can't parse input — fail open
-        print(json.dumps({"decision": "approve"}))
-        return
+        print("Error: Could not parse hook input from stdin.", file=sys.stderr)
+        sys.exit(1)
 
-    # Check if this is a tool we care about
     tool_name = hook_input.get("tool_name", "")
-    if tool_name not in TOOL_NAMES:
-        print(json.dumps({"decision": "approve"}))
-        return
+    _, file_path, content, old_content = extract_tool_input(hook_input)
 
-    # Load config
+    print(f"Tool:     {tool_name}")
+    print(f"File:     {file_path or '(none)'}")
+    print(f"Matches:  {should_review(file_path, config) if file_path else False}")
+
+    if content:
+        line_count = content.count("\n") + 1
+        max_lines: int = config.get("max_diff_lines", 200)
+        print(f"Lines:    {line_count} (max: {max_lines})")
+        if line_count > max_lines:
+            print("Action:   SKIP (exceeds max_diff_lines)")
+        elif file_path and not should_review(file_path, config):
+            print("Action:   SKIP (excluded by patterns)")
+        else:
+            print("Action:   WOULD REVIEW")
+            if old_content:
+                print(f"\n--- OLD ({len(old_content)} chars) ---")
+                print(old_content[:500])
+            print(f"\n--- NEW ({len(content)} chars) ---")
+            print(content[:500])
+    else:
+        print("Content:  (none)")
+        print("Action:   SKIP (no content)")
+
+
+# --- Main ---
+
+
+def main() -> None:
+    """Main entry point. Handles CLI args or hook input from stdin."""
+    parser = argparse.ArgumentParser(
+        prog="crosscheck",
+        description="Adversarial code review for AI-generated code",
+    )
+    parser.add_argument("--test", action="store_true", help="Test model connectivity")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be reviewed (stdin)"
+    )
+    parser.add_argument("--version", action="version", version=f"crosscheck {__version__}")
+
+    # Only parse known args — stdin may contain hook JSON
+    args, _ = parser.parse_known_args()
+
     config = load_config()
 
-    # Extract file path and content
-    file_path, content = extract_tool_input(hook_input)
+    if args.test:
+        cmd_test(config)
+        return
+
+    if args.dry_run:
+        cmd_dry_run(config)
+        return
+
+    # --- Hook mode ---
+    try:
+        raw_input = sys.stdin.read()
+        hook_input: dict[str, Any] = json.loads(raw_input)
+    except (json.JSONDecodeError, OSError):
+        approve()
+        return
+
+    tool_name = hook_input.get("tool_name", "")
+    if tool_name not in TOOL_NAMES:
+        approve()
+        return
+
+    _, file_path, content, old_content = extract_tool_input(hook_input)
     if not file_path or not content:
-        print(json.dumps({"decision": "approve"}))
+        approve()
         return
 
-    # Check if file matches patterns
     if not should_review(file_path, config):
-        print(json.dumps({"decision": "approve"}))
+        approve()
         return
 
-    # Check content length
     max_lines: int = config.get("max_diff_lines", 200)
     if content.count("\n") > max_lines:
-        print(json.dumps({"decision": "approve"}))
+        log(f"Skipping {file_path}: {content.count(chr(10))} lines > {max_lines} max")
+        approve()
         return
 
-    # Send to review model
-    prompt = build_review_prompt(file_path, content)
-    issues = call_review_model(prompt, config)
+    # Build prompt with diff context
+    prompt = build_review_prompt(tool_name, file_path, content, old_content)
+
+    log(f"Reviewing {file_path} ({content.count(chr(10)) + 1} lines)...")
+    issues, elapsed, _success = call_review_model(prompt, config)
+    log(f"Got {len(issues)} issue(s) in {elapsed:.1f}s")
 
     # Filter by threshold
     threshold: str = config.get("threshold", "medium")
-    issues = filter_by_threshold(issues, threshold)
+    filtered = filter_by_threshold(issues, threshold)
+    if len(filtered) < len(issues):
+        log(f"Filtered to {len(filtered)} issue(s) at threshold={threshold}")
 
-    # Format and output response
-    response = format_hook_response(issues, file_path)
+    response = format_hook_response(filtered, file_path, elapsed)
     print(json.dumps(response))
 
 

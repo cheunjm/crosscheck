@@ -2,7 +2,8 @@
   "model": "qwen2.5:14b",
   "endpoint": "http://localhost:11434/v1/chat/completions",
   "threshold": "medium",
-  "include": ["*.py", "*.ts", "*.js", "*.tsx", "*.jsx"],
-  "exclude": ["*.test.*", "*.spec.*", "node_modules/**"],
-  "max_diff_lines": 200
+  "include": ["*.py", "*.ts", "*.js", "*.tsx", "*.jsx", "*.go", "*.rs", "*.java"],
+  "exclude": ["*.test.*", "*.spec.*", "*.min.*", "node_modules/**", "dist/**", "build/**"],
+  "max_diff_lines": 200,
+  "timeout": 30
 }

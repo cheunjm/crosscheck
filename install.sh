@@ -46,4 +46,8 @@ cat <<'SETTINGS'
 }
 SETTINGS
 echo ""
-echo "Done. Make sure your review model is running (default: Ollama with qwen2.5:14b)."
+echo "Done. Verify your setup:"
+echo "  python3 ~/.claude/hooks/crosscheck.py --test"
+echo ""
+echo "Default model: Ollama with qwen2.5:14b at localhost:11434"
+echo "Edit ~/.claude/crosscheck.json to change model, endpoint, or thresholds."
