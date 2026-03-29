@@ -67,12 +67,17 @@ Focus on these categories:
 - AI-SPECIFIC: hallucinated imports/APIs, wrong function signatures, deprecated methods, \
 non-existent modules, incorrect async/await patterns
 
+For every import, verify the symbol actually exists in that module. \
+For every async call, verify the function is actually async.
+
 Do NOT flag:
 - Style preferences or formatting
 - Missing comments or documentation
 - Naming conventions
 - Type annotation completeness
 - Things that are clearly intentional from context
+
+Only flag issues you are confident about. When in doubt, skip it.
 
 Keep each message under 120 characters. Be specific.\
 """
