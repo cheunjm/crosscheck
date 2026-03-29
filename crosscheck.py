@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 import sys
@@ -81,6 +82,68 @@ Only flag issues you are confident about. When in doubt, skip it.
 
 Keep each message under 120 characters. Be specific.\
 """
+
+
+# --- Cache ---
+
+CACHE_PATH = Path("/tmp/crosscheck_cache.json")
+CACHE_MAX_ENTRIES = 100
+CACHE_TTL_SECONDS = 3600  # 1 hour
+
+
+def _cache_key(file_path: str, content: str, old_content: str | None) -> str:
+    """Generate a hash key from file path and content."""
+    h = hashlib.sha256()
+    h.update(file_path.encode())
+    h.update(content.encode())
+    if old_content:
+        h.update(old_content.encode())
+    return h.hexdigest()[:16]
+
+
+def _load_cache() -> dict[str, Any]:
+    """Load cache from disk. Returns empty dict on any error."""
+    try:
+        if CACHE_PATH.exists():
+            return json.loads(CACHE_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _save_cache(cache: dict[str, Any]) -> None:
+    """Save cache to disk, evicting old entries if over limit."""
+    now = time.time()
+    # Evict expired entries
+    cache = {k: v for k, v in cache.items() if now - v.get("ts", 0) < CACHE_TTL_SECONDS}
+    # Evict oldest if over limit
+    if len(cache) > CACHE_MAX_ENTRIES:
+        by_age = sorted(cache.items(), key=lambda x: x[1].get("ts", 0))
+        cache = dict(by_age[-CACHE_MAX_ENTRIES:])
+    try:
+        CACHE_PATH.write_text(json.dumps(cache))
+    except OSError:
+        pass
+
+
+def cache_lookup(file_path: str, content: str, old_content: str | None) -> dict[str, Any] | None:
+    """Check if we have a cached review result. Returns hook response or None."""
+    key = _cache_key(file_path, content, old_content)
+    cache = _load_cache()
+    entry = cache.get(key)
+    if entry and time.time() - entry.get("ts", 0) < CACHE_TTL_SECONDS:
+        return entry.get("response")
+    return None
+
+
+def cache_store(
+    file_path: str, content: str, old_content: str | None, response: dict[str, Any]
+) -> None:
+    """Store a review result in the cache."""
+    key = _cache_key(file_path, content, old_content)
+    cache = _load_cache()
+    cache[key] = {"ts": time.time(), "response": response}
+    _save_cache(cache)
 
 
 # --- Logging ---
@@ -531,6 +594,13 @@ def main() -> None:
         approve()
         return
 
+    # Check cache first
+    cached = cache_lookup(file_path, content, old_content)
+    if cached is not None:
+        log(f"Cache hit for {file_path}")
+        print(json.dumps(cached))
+        return
+
     # Build prompt with diff context
     prompt = build_review_prompt(tool_name, file_path, content, old_content)
 
@@ -545,6 +615,7 @@ def main() -> None:
         log(f"Filtered to {len(filtered)} issue(s) at threshold={threshold}")
 
     response = format_hook_response(filtered, file_path, elapsed)
+    cache_store(file_path, content, old_content, response)
     print(json.dumps(response))
 
 
