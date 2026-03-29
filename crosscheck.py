@@ -40,8 +40,8 @@ TOOL_NAMES: set[str] = {"Edit", "Write", "NotebookEdit"}
 SEVERITY_LEVELS: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "model": "qwen2.5:14b",
-    "endpoint": "http://localhost:11434/v1/chat/completions",
+    "model": "qwen3:8b",
+    "endpoint": "http://localhost:11434/api/chat",
     "threshold": "medium",
     "include": ["*.py", "*.ts", "*.js", "*.tsx", "*.jsx", "*.go", "*.rs", "*.java"],
     "exclude": ["*.test.*", "*.spec.*", "*.min.*", "node_modules/**", "dist/**", "build/**"],
@@ -195,15 +195,28 @@ def call_review_model(
     model: str = config["model"]
     timeout: int = config.get("timeout", 30)
 
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 1024,
-    }
+    is_ollama_native = "/api/chat" in endpoint
+
+    messages = [
+        {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+
+    if is_ollama_native:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "options": {"temperature": 0.1, "num_predict": 1024},
+            "think": False,
+            "stream": False,
+        }
+    else:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 1024,
+        }
 
     headers: dict[str, str] = {
         "Content-Type": "application/json",
@@ -237,14 +250,13 @@ def call_review_model(
 
     elapsed = time.monotonic() - start
 
-    # Extract the response content — handle thinking models
+    # Extract the response content — handle both API formats
     try:
-        choice = result["choices"][0]["message"]
-        response_text: str = choice.get("content") or ""
-
-        # Some models (e.g. qwen3, deepseek-r1) put reasoning in a separate field
-        if not response_text and "thinking" in choice:
-            response_text = ""
+        if is_ollama_native:
+            response_text: str = result.get("message", {}).get("content", "")
+        else:
+            choice = result["choices"][0]["message"]
+            response_text = choice.get("content") or ""
     except (KeyError, IndexError):
         return [], elapsed, False
 

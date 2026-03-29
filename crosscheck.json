@@ -1,6 +1,6 @@
 {
-  "model": "qwen2.5:14b",
-  "endpoint": "http://localhost:11434/v1/chat/completions",
+  "model": "qwen3:8b",
+  "endpoint": "http://localhost:11434/api/chat",
   "threshold": "medium",
   "include": ["*.py", "*.ts", "*.js", "*.tsx", "*.jsx", "*.go", "*.rs", "*.java"],
   "exclude": ["*.test.*", "*.spec.*", "*.min.*", "node_modules/**", "dist/**", "build/**"],
