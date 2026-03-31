@@ -21,18 +21,20 @@ Configuration:
 from __future__ import annotations
 
 import argparse
+import difflib
 import fnmatch
 import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # --- Constants ---
 
@@ -48,6 +50,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "exclude": ["*.test.*", "*.spec.*", "*.min.*", "node_modules/**", "dist/**", "build/**"],
     "max_diff_lines": 200,
     "timeout": 30,
+    "context_lines": 10,
 }
 
 REVIEW_SYSTEM_PROMPT = """\
@@ -121,7 +124,16 @@ def _save_cache(cache: dict[str, Any]) -> None:
         by_age = sorted(cache.items(), key=lambda x: x[1].get("ts", 0))
         cache = dict(by_age[-CACHE_MAX_ENTRIES:])
     try:
-        CACHE_PATH.write_text(json.dumps(cache))
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=CACHE_PATH.parent, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(cache, f)
+            os.rename(tmp_path, str(CACHE_PATH))
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     except OSError:
         pass
 
@@ -176,12 +188,13 @@ def load_config() -> dict[str, Any]:
         "CROSSCHECK_THRESHOLD": "threshold",
         "CROSSCHECK_MAX_DIFF_LINES": "max_diff_lines",
         "CROSSCHECK_TIMEOUT": "timeout",
+        "CROSSCHECK_CONTEXT_LINES": "context_lines",
     }
 
     for env_key, config_key in env_map.items():
         val = os.environ.get(env_key)
         if val is not None:
-            if config_key in ("max_diff_lines", "timeout"):
+            if config_key in ("max_diff_lines", "timeout", "context_lines"):
                 config[config_key] = int(val)
             else:
                 config[config_key] = val
@@ -222,17 +235,116 @@ def should_review(file_path: str, config: dict[str, Any]) -> bool:
 # --- Diff context ---
 
 
+def read_surrounding_context(
+    file_path: str, old_string: str, context_lines: int = 10
+) -> str | None:
+    """Read surrounding lines around old_string in the file on disk.
+
+    Returns formatted context string, or None if file can't be read
+    or old_string not found.
+    """
+    try:
+        file_content = Path(file_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    idx = file_content.find(old_string)
+    if idx == -1:
+        return None
+
+    lines = file_content.splitlines(keepends=True)
+
+    # Find which line the match starts on
+    char_count = 0
+    start_line = 0
+    for i, line in enumerate(lines):
+        if char_count + len(line) > idx:
+            start_line = i
+            break
+        char_count += len(line)
+
+    # Find which line the match ends on
+    end_idx = idx + len(old_string)
+    char_count = 0
+    end_line = len(lines) - 1
+    for i, line in enumerate(lines):
+        char_count += len(line)
+        if char_count >= end_idx:
+            end_line = i
+            break
+
+    context_before = max(0, start_line - context_lines)
+    context_after = min(len(lines), end_line + context_lines + 1)
+
+    before_lines = lines[context_before:start_line]
+    after_lines = lines[end_line + 1 : context_after]
+
+    parts: list[str] = []
+    if before_lines:
+        parts.append("".join(before_lines).rstrip("\n"))
+    parts.append(f">>> EDIT STARTS HERE (line {start_line + 1}) <<<")
+    parts.append(f">>> EDIT ENDS HERE (line {end_line + 1}) <<<")
+    if after_lines:
+        parts.append("".join(after_lines).rstrip("\n"))
+
+    return "\n".join(parts)
+
+
+def compute_file_diff(
+    file_path: str, new_content: str, max_lines: int = 200
+) -> tuple[str | None, bool]:
+    """Compute a unified diff between existing file and new content.
+
+    Returns (diff_text, is_new_file).
+    - File doesn't exist: (None, True) — caller uses full content
+    - Identical content: (None, False) — skip review
+    - Changes present: (diff_text, False)
+    - Diff exceeds max_lines: (None, False) — too large to review
+    """
+    try:
+        old_content = Path(file_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None, True
+
+    if old_content == new_content:
+        return None, False
+
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+
+    diff = list(difflib.unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=f"a/{os.path.basename(file_path)}",
+        tofile=f"b/{os.path.basename(file_path)}",
+    ))
+
+    if not diff:
+        return None, False
+
+    if len(diff) > max_lines:
+        return None, False
+
+    return "".join(diff), False
+
+
 def build_review_prompt(
     tool_name: str,
     file_path: str,
     content: str,
     old_content: str | None = None,
+    surrounding_context: str | None = None,
+    diff_text: str | None = None,
 ) -> str:
     """Build the review prompt with full diff context."""
     parts: list[str] = []
 
     if tool_name == "Edit" and old_content:
         parts.append(f"Review this edit to `{file_path}`:")
+        if surrounding_context:
+            parts.append("")
+            parts.append("SURROUNDING CODE (for context):")
+            parts.append(f"```\n{surrounding_context}\n```")
         parts.append("")
         parts.append("BEFORE:")
         parts.append(f"```\n{old_content}\n```")
@@ -240,8 +352,12 @@ def build_review_prompt(
         parts.append("AFTER:")
         parts.append(f"```\n{content}\n```")
     elif tool_name == "Write":
-        parts.append(f"Review this new file being written to `{file_path}`:")
-        parts.append(f"```\n{content}\n```")
+        if diff_text:
+            parts.append(f"Review this change to existing file `{file_path}`:")
+            parts.append(f"```diff\n{diff_text}\n```")
+        else:
+            parts.append(f"Review this new file being written to `{file_path}`:")
+            parts.append(f"```\n{content}\n```")
     else:
         parts.append(f"Review this code change in `{file_path}`:")
         parts.append(f"```\n{content}\n```")
@@ -522,12 +638,31 @@ def cmd_dry_run(config: dict[str, Any]) -> None:
         line_count = content.count("\n") + 1
         max_lines: int = config.get("max_diff_lines", 200)
         print(f"Lines:    {line_count} (max: {max_lines})")
-        if line_count > max_lines:
-            print("Action:   SKIP (exceeds max_diff_lines)")
-        elif file_path and not should_review(file_path, config):
+
+        # Check for Write diffs first — a large file may have a small diff
+        write_diff = None
+        if tool_name == "Write" and file_path:
+            diff_result, is_new = compute_file_diff(file_path, content, max_lines)
+            if not is_new and diff_result is None:
+                print("Action:   SKIP (no changes or diff too large)")
+            else:
+                write_diff = diff_result
+
+        if file_path and not should_review(file_path, config):
             print("Action:   SKIP (excluded by patterns)")
+        elif write_diff is None and tool_name != "Write" and line_count > max_lines:
+            print("Action:   SKIP (exceeds max_diff_lines)")
         else:
             print("Action:   WOULD REVIEW")
+            if tool_name == "Edit" and old_content and file_path:
+                ctx_lines_cfg: int = config.get("context_lines", 10)
+                ctx = read_surrounding_context(file_path, old_content, ctx_lines_cfg)
+                if ctx:
+                    print("\n--- SURROUNDING CONTEXT ---")
+                    print(ctx[:500])
+            if write_diff:
+                print("\n--- DIFF (existing file) ---")
+                print(write_diff[:500])
             if old_content:
                 print(f"\n--- OLD ({len(old_content)} chars) ---")
                 print(old_content[:500])
@@ -589,7 +724,21 @@ def main() -> None:
         return
 
     max_lines: int = config.get("max_diff_lines", 200)
-    if content.count("\n") > max_lines:
+
+    # For Write operations, try to compute a diff first — the diff may be
+    # small even if the full file is large
+    diff_text = None
+    if tool_name == "Write":
+        diff_result, is_new = compute_file_diff(file_path, content, max_lines)
+        if not is_new and diff_result is None:
+            log(f"Skipping {file_path}: no changes or diff too large")
+            approve()
+            return
+        diff_text = diff_result
+
+    # Skip if raw content exceeds max lines (but not for Write with a diff,
+    # since the diff is what we'll actually send to the reviewer)
+    if diff_text is None and content.count("\n") > max_lines:
         log(f"Skipping {file_path}: {content.count(chr(10))} lines > {max_lines} max")
         approve()
         return
@@ -601,8 +750,15 @@ def main() -> None:
         print(json.dumps(cached))
         return
 
-    # Build prompt with diff context
-    prompt = build_review_prompt(tool_name, file_path, content, old_content)
+    # Gather surrounding context for Edit operations
+    surrounding_context = None
+    if tool_name == "Edit" and old_content:
+        ctx_lines: int = config.get("context_lines", 10)
+        surrounding_context = read_surrounding_context(file_path, old_content, ctx_lines)
+
+    prompt = build_review_prompt(
+        tool_name, file_path, content, old_content, surrounding_context, diff_text
+    )
 
     log(f"Reviewing {file_path} ({content.count(chr(10)) + 1} lines)...")
     issues, elapsed, _success = call_review_model(prompt, config)

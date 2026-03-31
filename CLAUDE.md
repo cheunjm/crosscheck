@@ -5,17 +5,19 @@ Adversarial code review hook for Claude Code. Sends AI-generated diffs to a seco
 ## Structure
 
 ```
-crosscheck.py       Main hook script (single file, zero dependencies)
-crosscheck.json     Example configuration
-install.sh          Installer script
+crosscheck.py            Main hook script (single file, zero dependencies)
+test_crosscheck.py       Unit tests (unittest, zero dependencies)
+crosscheck.json          Example configuration
+install.sh               Installer script
 ```
 
 ## Development
 
 ```bash
-ruff check crosscheck.py    # Lint
-mypy crosscheck.py          # Type check
-python3 crosscheck.py --test # Verify model connectivity
+ruff check crosscheck.py test_crosscheck.py    # Lint
+mypy crosscheck.py test_crosscheck.py           # Type check
+python3 -m unittest discover -s . -p "test_*.py" -v  # Unit tests
+python3 crosscheck.py --test                    # Verify model connectivity
 python3 crosscheck.py --version
 ```
 
@@ -47,4 +49,5 @@ echo '{"tool_name":"Write","tool_input":{"file_path":"app.py","content":"import 
 - **Fail open** — never blocks edits, only warns
 - **Diff context** — Edit operations send both old and new content
 - **AI-specific prompt** — tuned to catch hallucinated imports, wrong signatures, deprecated methods
-- **Configurable** — model, endpoint, threshold, patterns, timeout
+- **Configurable** — model, endpoint, threshold, patterns, timeout, context_lines
+- **Smart diffs** — Edit operations include surrounding file context; Write operations send unified diffs for existing files

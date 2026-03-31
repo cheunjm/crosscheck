@@ -23,7 +23,10 @@ jobs:
         run: pip install ruff mypy
 
       - name: Lint with ruff
-        run: ruff check crosscheck.py
+        run: ruff check crosscheck.py test_crosscheck.py
 
       - name: Type check with mypy
-        run: mypy crosscheck.py --ignore-missing-imports
+        run: mypy crosscheck.py test_crosscheck.py --ignore-missing-imports
+
+      - name: Run tests
+        run: python3 -m unittest discover -s . -p "test_*.py" -v
