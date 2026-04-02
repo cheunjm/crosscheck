@@ -1,0 +1,27 @@
+name: Changeset Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  changeset:
+    name: changeset
+    if: "!startsWith(github.head_ref, 'changeset-release/')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch base branch
+        run: git fetch origin ${{ github.base_ref }} --depth=1
+
+      - name: Check for changeset
+        run: |
+          ADDED=$(git diff origin/${{ github.base_ref }} HEAD --name-only --diff-filter=A | grep -E '^\.changeset/.+\.md$' | grep -vF 'README.md' || true)
+          if [ -z "$ADDED" ]; then
+            echo "No changeset found. Run 'npx changeset' to document this change."
+            echo "See: https://github.com/changesets/changesets"
+            exit 1
+          fi
+          echo "Changeset(s) found:"
+          echo "$ADDED"
