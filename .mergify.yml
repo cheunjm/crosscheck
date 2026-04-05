@@ -7,7 +7,7 @@ pull_request_rules:
   - name: Keep branches up-to-date
     conditions:
       - base=main
-      - "#conflict=0"
+      - "-conflict"
       - "-draft"
     actions:
       update: {}
