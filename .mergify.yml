@@ -10,8 +10,7 @@ pull_request_rules:
       - "#conflict=0"
       - "-draft"
     actions:
-      update:
-
+      update: {}
 
   - name: Queue dependabot PRs
     conditions:
