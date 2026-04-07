@@ -18,7 +18,7 @@ jobs:
       - name: Check if CI-only PR
         id: ci_only
         run: |
-          NON_CI=$(git diff origin/${{ github.base_ref }} HEAD --name-only | grep -v '^\.github/' || true)
+          NON_CI=$(git diff origin/${{ github.base_ref }} HEAD --name-only --diff-filter=ACMR | grep -v '^\.github/' || true)
           if [ -z "$NON_CI" ]; then
             echo "skip=true" >> $GITHUB_OUTPUT
           else
