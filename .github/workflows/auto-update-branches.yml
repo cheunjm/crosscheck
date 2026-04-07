@@ -1,0 +1,9 @@
+name: Auto-update PR branches
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  update:
+    uses: aramiworks/.github/.github/workflows/auto-update-branches.yml@main
