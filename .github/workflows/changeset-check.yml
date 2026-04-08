@@ -15,19 +15,18 @@ jobs:
       - name: Fetch base branch
         run: git fetch origin ${{ github.base_ref }} --depth=1
 
-      - name: Check if CI-only change
-        id: ci-only
+      - name: Check if CI-only PR
+        id: ci_only
         run: |
-          CHANGED=$(git diff origin/${{ github.base_ref }} HEAD --name-only)
-          NON_CI=$(echo "$CHANGED" | grep -v '^\.github/' || true)
+          NON_CI=$(git diff origin/${{ github.base_ref }} HEAD --name-only --diff-filter=ACMR | grep -v '^\.github/' || true)
           if [ -z "$NON_CI" ]; then
-            echo "result=true" >> $GITHUB_OUTPUT
+            echo "skip=true" >> $GITHUB_OUTPUT
           else
-            echo "result=false" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Check for changeset
-        if: steps.ci-only.outputs.result == 'false'
+        if: steps.ci_only.outputs.skip != 'true'
         run: |
           ADDED=$(git diff origin/${{ github.base_ref }} HEAD --name-only --diff-filter=A | grep -E '^\.changeset/.+\.md$' | grep -vF 'README.md' || true)
           if [ -z "$ADDED" ]; then
