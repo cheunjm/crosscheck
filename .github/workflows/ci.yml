@@ -38,7 +38,7 @@ jobs:
       - name: Lint with ruff
         run: ruff check crosscheck.py test_crosscheck.py
 
-  check-types:
+  type-check:
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
