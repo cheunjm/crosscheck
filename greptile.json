@@ -1,0 +1,7 @@
+{
+  "excludeAuthors": [
+    "mergify[bot]",
+    "dependabot[bot]",
+    "renovate[bot]"
+  ]
+}
