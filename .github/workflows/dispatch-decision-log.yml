@@ -14,8 +14,8 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ secrets.OPENCLAW_BOT_APP_ID }}
-          private-key: ${{ secrets.OPENCLAW_BOT_PRIVATE_KEY }}
+          app-id: ${{ secrets.CLAUDE_ARAMI_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_ARAMI_PRIVATE_KEY }}
           repositories: engineering-log
 
       - name: Calculate time to merge
@@ -42,7 +42,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X POST "https://api.github.com/repos/cheunjm/engineering-log/dispatches" \
+            -X POST "https://api.github.com/repos/aramiworks/engineering-log/dispatches" \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -d @- <<'PAYLOAD'
