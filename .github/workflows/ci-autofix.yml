@@ -1,0 +1,15 @@
+name: CI Autofix
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+jobs:
+  autofix:
+    uses: aramiworks/.github/.github/workflows/ci-autofix.yml@main
+    with:
+      format_fix_command: "ruff format ."
+      lint_fix_command: "ruff check --fix ."
+      python_version: "3.12"
+    secrets: inherit
