@@ -1,0 +1,71 @@
+name: Claude Changeset
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  generate-changeset:
+    name: generate-changeset
+    runs-on: ubuntu-latest
+    if: "!startsWith(github.head_ref, 'changeset-release/')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch base branch
+        run: git fetch origin ${{ github.base_ref }} --depth=1
+
+      - name: Check for existing changeset
+        id: check
+        run: |
+          ADDED=$(git diff origin/${{ github.base_ref }} HEAD --name-only --diff-filter=A | grep -E '^\.changeset/.+\.md$' | grep -vF 'README.md' || true)
+          echo "has_changeset=$([ -n \"$ADDED\" ] && echo true || echo false)" >> $GITHUB_OUTPUT
+
+      - uses: anthropics/claude-code-action@v1
+        if: steps.check.outputs.has_changeset == 'false'
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: --allowedTools Bash
+          prompt: |
+            This PR is missing a changeset file. Create one.
+
+            Steps:
+            1. See what changed: `git diff origin/${{ github.base_ref }} HEAD --stat`
+            2. Check changeset config: `cat .changeset/config.json`
+            3. Find package name(s):
+               - Check root `package.json` for `"name"` field
+               - For monorepos, look for workspace packages and only include those affected by the diff
+            4. Pick the bump type:
+               - patch: bug fixes, chores, CI/tooling, dependency updates
+               - minor: new backwards-compatible features
+               - major: breaking changes
+            5. Create `.changeset/<kebab-slug>.md` where slug describes the change in 3-5 words
+
+            File format:
+            ```
+            ---
+            "package-name": patch
+            ---
+
+            One-sentence description of what changed.
+            ```
+
+            6. Commit and push:
+            ```bash
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .changeset/
+            git commit -m "chore: add changeset"
+            git push
+            ```
+
+            Keep it factual and concise. Focus on what changed from a user's perspective.
